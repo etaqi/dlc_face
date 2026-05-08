@@ -63,6 +63,7 @@ show_mouth_mask_box: bool = False  # Visualize the mouth mask area (for debuggin
 mask_feather_ratio: int = 12       # Denominator for feathering calculation (higher = smaller feather)
 mask_down_size: float = 0.1        # Expansion factor for lower lip mask (relative)
 mask_size: float = 1.0             # Expansion factor for upper lip mask (relative)
+mouth_mask_size: float = 0.0       # Mouth mask size (0-100; 0=off, 100=mouth to chin)
 
 # --- START: Added for Frame Interpolation ---
 enable_interpolation: bool = True # Toggle temporal smoothing
@@ -70,3 +71,6 @@ interpolation_weight: float = 0  # Blend weight for current frame (0.0-1.0). Low
 # --- END: Added for Frame Interpolation ---
 
 # --- END OF FILE globals.py ---
+
+import threading
+dml_lock = threading.Lock()
