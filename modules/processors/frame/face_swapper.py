@@ -1,4 +1,4 @@
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 import cv2
 import insightface
 import logging
@@ -7,6 +7,7 @@ import numpy as np
 import platform
 import modules.globals
 import modules.processors.frame.core
+from modules import imread_unicode, imwrite_unicode
 from modules.core import update_status
 from modules.face_analyser import get_one_face, get_many_faces, default_source_face
 from modules.typing import Face, Frame
@@ -16,7 +17,7 @@ from modules.utilities import (
     is_video,
 )
 from modules.cluster_analysis import find_closest_centroid
-from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize, gpu_cvt_color
+from modules.gpu_processing import gpu_gaussian_blur, gpu_sharpen, gpu_add_weighted, gpu_resize
 import os
 from collections import deque
 import time
@@ -28,6 +29,149 @@ NAME = "DLC.FACE-SWAPPER"
 # --- START: Added for Interpolation ---
 PREVIOUS_FRAME_RESULT = None # Stores the final processed frame from the previous step
 # --- END: Added for Interpolation ---
+
+# --- Poisson blend (ported from deep-live-cam-gumroad-edition) ---
+# Root-cause fix for the "wobble": the blend mask is NOT built from the
+# independently-detected 106-pt landmarks (they jitter sub-pixel every frame
+# and seamlessClone is hyper-sensitive to its mask boundary). Instead it is
+# derived from the swap's OWN affine transform (M) + the swapped pixels
+# (bgr_fake), so the mask is locked exactly to where the swapped face was
+# placed — no independent jitter source, no EMA, no lag. The mask is cached
+# when the face is nearly still so an identical array is reused (zero wobble).
+_ELLIPTICAL_MASK_CACHE: dict = {}
+_poisson_cached_mask: Optional[np.ndarray] = None
+_poisson_cached_key: Optional[tuple] = None
+
+
+def _create_elliptical_mask(size: Tuple[int, int]) -> np.ndarray:
+    """Fixed, heavily-blurred elliptical mask in aligned-face space.
+
+    Geometry-based (not content-adaptive) and cached by size — identical
+    every frame for the same model input size, so it contributes no jitter.
+    """
+    global _ELLIPTICAL_MASK_CACHE
+    if size in _ELLIPTICAL_MASK_CACHE:
+        return _ELLIPTICAL_MASK_CACHE[size]
+    h, w = size
+    center = (w // 2, h // 2)
+    axes = (int(w * 0.44), int(h * 0.44))
+    mask = np.zeros((h, w), dtype=np.float32)
+    cv2.ellipse(mask, center, axes, 0, 0, 360, 1, -1)
+    if h * w < 65536:
+        mask = cv2.GaussianBlur(mask, (31, 31), 12)
+    else:
+        mask = gpu_gaussian_blur(mask, (31, 31), 12)
+    _ELLIPTICAL_MASK_CACHE[size] = mask
+    return mask
+
+
+def _apply_poisson_blend(swapped_frame: Frame, original_frame: Frame,
+                         target_face: Face, affine_matrix: np.ndarray = None,
+                         bgr_fake: np.ndarray = None) -> Frame:
+    """Poisson-blend the swapped face onto the original frame.
+
+    Preferred path derives the blend mask from the swap's inverse affine so
+    it tracks the swapped face exactly per-frame (no landmark jitter, no
+    smoothing). Falls back to a cached bbox-ellipse if the affine is absent.
+    Writes only the blended ellipse back so other faces are preserved.
+    """
+    global _poisson_cached_mask, _poisson_cached_key
+    try:
+        # ---- Preferred: blend ONLY the genuinely-swapped region ----
+        # Use the exact paste-back mask (warped elliptical mask), eroded so
+        # the Poisson seam sits on solidly-swapped pixels only.
+        if affine_matrix is not None and bgr_fake is not None:
+            try:
+                h, w = swapped_frame.shape[:2]
+                fh, fw = bgr_fake.shape[:2]
+                inv = cv2.invertAffineTransform(affine_matrix)
+                corners = np.array([[0, 0, 1], [fw, 0, 1], [fw, fh, 1], [0, fh, 1]],
+                                   dtype=np.float32)
+                t = corners @ inv.T
+                px1 = max(0, int(np.floor(t[:, 0].min())))
+                py1 = max(0, int(np.floor(t[:, 1].min())))
+                px2 = min(w, int(np.ceil(t[:, 0].max())))
+                py2 = min(h, int(np.ceil(t[:, 1].max())))
+                rw, rh = px2 - px1, py2 - py1
+                if rw > 8 and rh > 8:
+                    roi_aff = inv.copy()
+                    roi_aff[0, 2] -= px1
+                    roi_aff[1, 2] -= py1
+                    fm = _create_elliptical_mask((fh, fw))
+                    mroi = cv2.warpAffine(fm, roi_aff, (rw, rh),
+                                          flags=cv2.INTER_LINEAR,
+                                          borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+                    bin_roi = np.where(mroi > 0.5, np.uint8(255), np.uint8(0))
+                    k = max(3, (min(rw, rh) // 20) | 1)
+                    bin_roi = cv2.erode(bin_roi,
+                                        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+                    bx, by, bw, bh = cv2.boundingRect(bin_roi)
+                    if bw > 0 and bh > 0:
+                        mx1, my1 = px1 + bx, py1 + by
+                        mx2, my2 = mx1 + bw - 1, my1 + bh - 1
+                        # seamlessClone needs the cloned region off the border
+                        if mx1 > 0 and my1 > 0 and mx2 < w - 1 and my2 < h - 1:
+                            mask = np.zeros((h, w), dtype=np.uint8)
+                            mask[py1:py2, px1:px2] = bin_roi
+                            center = (mx1 + bw // 2, my1 + bh // 2)
+                            blended = cv2.seamlessClone(swapped_frame, original_frame,
+                                                        mask, center, cv2.NORMAL_CLONE)
+                            np.copyto(swapped_frame[my1:my2 + 1, mx1:mx2 + 1],
+                                      blended[my1:my2 + 1, mx1:mx2 + 1],
+                                      where=mask[my1:my2 + 1, mx1:mx2 + 1, None].astype(bool))
+                            return swapped_frame
+            except Exception:
+                pass  # fall through to the robust bbox-ellipse path below
+        # ---- Fallback: bbox-ellipse (defensive, cached when still) ----
+        if not hasattr(target_face, 'bbox') or target_face.bbox is None:
+            return swapped_frame
+        x1, y1, x2, y2 = target_face.bbox.astype(int)
+        h, w = swapped_frame.shape[:2]
+        x1, y1 = (max(0, x1), max(0, y1))
+        x2, y2 = (min(w, x2), min(h, y2))
+        if x2 <= x1 or y2 <= y1 or x2 - x1 <= 10 or (y2 - y1 <= 10):
+            return swapped_frame
+        padding = int(min(x2 - x1, y2 - y1) * 0.1)
+        x1_p = max(0, x1 - padding)
+        y1_p = max(0, y1 - padding)
+        x2_p = min(w, x2 + padding)
+        y2_p = min(h, y2 + padding)
+        center_x = int(round((x1 + x2) / 2.0))
+        center_y = int(round((y1 + y2) / 2.0))
+        radius_x = max(1, int(round((x2_p - x1_p) / 2.0)))
+        radius_y = max(1, int(round((y2_p - y1_p) / 2.0)))
+        if not (0 <= center_x < w and 0 <= center_y < h):
+            return swapped_frame
+        center = (center_x, center_y)
+        if center_x - radius_x < 0 or center_x + radius_x >= w or center_y - radius_y < 0 or (center_y + radius_y >= h):
+            return swapped_frame
+        # Reuse cached mask when center/radius unchanged frame-to-frame
+        # (face nearly still) — saves the np.zeros + cv2.ellipse, and the
+        # identical array means literally zero wobble while still.
+        mask_key = (center_x, center_y, radius_x, radius_y, h, w)
+        if _poisson_cached_key == mask_key and _poisson_cached_mask is not None:
+            mask = _poisson_cached_mask
+        else:
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.ellipse(mask, center, (radius_x, radius_y), 0, 0, 360, 255, -1)
+            if np.sum(mask) == 0:
+                return swapped_frame
+            _poisson_cached_mask = mask
+            _poisson_cached_key = mask_key
+        blended = cv2.seamlessClone(swapped_frame, original_frame, mask, center, cv2.NORMAL_CLONE)
+        # Composite ONLY this face's ellipse back (ROI-bounded) so previously
+        # blended faces in multi-face mode are preserved.
+        rx0 = max(0, center_x - radius_x)
+        rx1 = min(w, center_x + radius_x + 1)
+        ry0 = max(0, center_y - radius_y)
+        ry1 = min(h, center_y + radius_y + 1)
+        roi_mask = mask[ry0:ry1, rx0:rx1]
+        np.copyto(swapped_frame[ry0:ry1, rx0:rx1],
+                  blended[ry0:ry1, rx0:rx1],
+                  where=roi_mask[:, :, None].astype(bool))
+        return swapped_frame
+    except Exception:
+        return swapped_frame
 
 # --- START: Mac M1-M5 Optimizations ---
 IS_APPLE_SILICON = platform.system() == 'Darwin' and platform.machine() == 'arm64'
@@ -173,11 +317,16 @@ def _get_soft_alpha(size: int) -> np.ndarray:
     the feather radius scales naturally with the affine transform.
     """
     if _paste_cache['alpha_size'] != size:
-        k_erode = max(size // 10, 3)
-        k_blur = max(size // 20, 3)
-        mask = np.full((size, size), 255, dtype=np.uint8)
-        mask = cv2.erode(mask, np.ones((k_erode, k_erode), np.uint8), iterations=1)
-        mask = cv2.GaussianBlur(mask, (2 * k_blur + 1, 2 * k_blur + 1), 0)
+        # Elliptical (not square) template — matches the gumroad edition's
+        # _create_elliptical_mask. A full/eroded square leaves the aligned
+        # crop's corners near-opaque, so the swapped square's straight edges
+        # show as a visible box on the face. An ellipse (axes 0.44*size) zeroes
+        # the corners and the heavy blur feathers smoothly into the original.
+        center = (size // 2, size // 2)
+        axes = (int(size * 0.44), int(size * 0.44))
+        mask = np.zeros((size, size), dtype=np.uint8)
+        cv2.ellipse(mask, center, axes, 0, 0, 360, 255, -1)
+        mask = cv2.GaussianBlur(mask, (31, 31), 12)
         _paste_cache['soft_alpha'] = mask  # uint8 [0, 255] — blended via cv2 SIMD ops
         _paste_cache['alpha_size'] = size
     return _paste_cache['soft_alpha']
@@ -368,7 +517,12 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
     opacity = getattr(modules.globals, "opacity", 1.0)
     opacity = max(0.0, min(1.0, opacity))
     mouth_mask_enabled = getattr(modules.globals, "mouth_mask", False)
-    needs_original = opacity < 1.0 or mouth_mask_enabled
+    poisson_blend_enabled = getattr(modules.globals, "poisson_blend", False)
+    # Poisson blend's seamlessClone needs the genuine pre-swap frame as its
+    # destination. Without this, original_frame aliases temp_frame, which
+    # _fast_paste_back mutates in place — so seamlessClone would blend the
+    # swapped face onto the already-swapped frame (no visible effect).
+    needs_original = opacity < 1.0 or mouth_mask_enabled or poisson_blend_enabled
     if needs_original:
         original_frame = temp_frame.copy()
     else:
@@ -436,34 +590,14 @@ def swap_face(source_face: Face, target_face: Face, temp_frame: Frame) -> Frame:
                 )
         
     # --- Poisson Blending ---
+    # Mask derived from the swap's own affine (M) + swapped pixels (bgr_fake),
+    # so it tracks the swapped face exactly per-frame — no landmark jitter,
+    # no EMA, no lag. See _apply_poisson_blend.
     if getattr(modules.globals, "poisson_blend", False):
-        face_mask = create_face_mask(target_face, temp_frame)
-        if face_mask is not None:
-            # Find bounding box of the mask
-            y_indices, x_indices = np.where(face_mask > 0)
-            if len(x_indices) > 0 and len(y_indices) > 0:
-                x_min, x_max = np.min(x_indices), np.max(x_indices)
-                y_min, y_max = np.min(y_indices), np.max(y_indices)
+        swapped_frame = _apply_poisson_blend(
+            swapped_frame, original_frame, target_face, M, bgr_fake
+        )
 
-                # Calculate center
-                center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
-
-                # Crop src and mask
-                src_crop = swapped_frame[y_min : y_max + 1, x_min : x_max + 1]
-                mask_crop = face_mask[y_min : y_max + 1, x_min : x_max + 1]
-
-                try:
-                    # Use original_frame as destination to blend the swapped face onto it
-                    swapped_frame = cv2.seamlessClone(
-                        src_crop,
-                        original_frame,
-                        mask_crop,
-                        center,
-                        cv2.NORMAL_CLONE,
-                    )
-                except Exception as e:
-                    print(f"Poisson blending failed: {e}")
-        
     # Apply opacity blend between the original frame and the swapped frame
     if opacity >= 1.0:
         return swapped_frame.astype(np.uint8)
@@ -547,7 +681,8 @@ def apply_post_processing(current_frame: Frame, swapped_face_bboxes: List[np.nda
                 continue
 
             face_region = processed_frame[y1:y2, x1:x2]
-            if face_region.size == 0: continue
+            if face_region.size == 0:
+                continue
 
             # Apply sharpening (GPU-accelerated when CUDA OpenCV is available)
             try:
@@ -682,9 +817,11 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
             else: # Single face or specific mapping
                  for map_data in source_target_map:
                     source_info = map_data.get("source", {})
-                    if not source_info: continue # Skip if no source info
+                    if not source_info:
+                        continue # Skip if no source info
                     source_face = source_info.get("face")
-                    if not source_face: continue # Skip if no source defined for this map entry
+                    if not source_face:
+                        continue # Skip if no source defined for this map entry
 
                     if is_image(modules.globals.target_path):
                         target_info = map_data.get("target", {})
@@ -721,7 +858,8 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                      if len(detected_faces) <= len(target_embeddings):
                           # More targets defined than detected - match each detected face
                           for detected_face in detected_faces:
-                              if detected_face.normed_embedding is None: continue
+                              if detected_face.normed_embedding is None:
+                                  continue
                               closest_idx, _ = find_closest_centroid(target_embeddings, detected_face.normed_embedding)
                               if 0 <= closest_idx < len(source_faces):
                                   source_target_pairs.append((source_faces[closest_idx], detected_face))
@@ -729,7 +867,8 @@ def process_frame_v2(temp_frame: Frame, temp_frame_path: str = "") -> Frame:
                           # More faces detected than targets defined - match each target embedding to closest detected face
                           detected_embeddings = [f.normed_embedding for f in detected_faces if f.normed_embedding is not None]
                           detected_faces_with_embedding = [f for f in detected_faces if f.normed_embedding is not None]
-                          if not detected_embeddings: return processed_frame # No embeddings to match
+                          if not detected_embeddings:
+                              return processed_frame # No embeddings to match
 
                           for i, target_embedding in enumerate(target_embeddings):
                               if 0 <= i < len(source_faces): # Ensure source face exists for this embedding
@@ -779,7 +918,7 @@ def process_frames(
             # Log the error but allow proceeding; subsequent check will stop processing.
         else:
             try:
-                source_img = cv2.imread(source_path)
+                source_img = imread_unicode(source_path)
                 if source_img is None:
                     # Specific error for file reading failure
                     update_status(f"Error reading source image file {source_path}. Please check the path and file integrity.", NAME)
@@ -803,7 +942,7 @@ def process_frames(
 
     # --- Stop processing entirely if in Simple Mode and source face is invalid ---
     if not use_v2 and source_face is None:
-        update_status(f"Halting video processing: Invalid or no face detected in source image for simple mode.", NAME)
+        update_status("Halting video processing: Invalid or no face detected in source image for simple mode.", NAME)
         if progress:
             # Ensure the progress bar completes if it was started
             remaining_updates = total_frames - progress.n if hasattr(progress, 'n') else total_frames
@@ -819,14 +958,16 @@ def process_frames(
         # Read the target frame
         temp_frame = None
         try:
-            temp_frame = cv2.imread(temp_frame_path)
+            temp_frame = imread_unicode(temp_frame_path)
             if temp_frame is None:
                 print(f"{NAME}: Error: Could not read frame: {temp_frame_path}, skipping.")
-                if progress: progress.update(1)
+                if progress:
+                    progress.update(1)
                 continue # Skip this frame if read fails
         except Exception as read_e:
             print(f"{NAME}: Error reading frame {temp_frame_path}: {read_e}, skipping.")
-            if progress: progress.update(1)
+            if progress:
+                progress.update(1)
             continue
 
         # Select processing function and execute
@@ -855,7 +996,7 @@ def process_frames(
         # Write the result back to the same frame path with optimized compression
         try:
             # Use PNG compression level 3 (faster) instead of default 9
-            write_success = cv2.imwrite(temp_frame_path, result_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
+            write_success = imwrite_unicode(temp_frame_path, result_frame, [cv2.IMWRITE_PNG_COMPRESSION, 3])
             if not write_success:
                 print(f"{NAME}: Error: Failed to write processed frame to {temp_frame_path}")
         except Exception as write_e:
@@ -885,7 +1026,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
     # Read target first
     try:
-        target_frame = cv2.imread(target_path)
+        target_frame = imread_unicode(target_path)
         if target_frame is None:
             update_status(f"Error: Could not read target image: {target_path}", NAME)
             return
@@ -904,7 +1045,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
         else: # Simple mode
             try:
-                source_img = cv2.imread(source_path)
+                source_img = imread_unicode(source_path)
                 if source_img is None:
                     update_status(f"Error: Could not read source image: {source_path}", NAME)
                     return
@@ -920,7 +1061,7 @@ def process_image(source_path: str, target_path: str, output_path: str) -> None:
 
         # Write the result if processing was successful
         if result is not None:
-            write_success = cv2.imwrite(output_path, result)
+            write_success = imwrite_unicode(output_path, result)
             if write_success:
                 update_status(f"Output image saved to: {output_path}", NAME)
             else:
@@ -978,13 +1119,20 @@ def create_lower_mouth_mask(
         return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
     try: # Wrap main logic in try-except
-        # Use outer mouth landmarks (52-71) to capture the full mouth area
-        # This covers both upper and lower lips for proper mouth preservation
-        lower_lip_order = list(range(52, 72))
+        # Outer mouth/lip landmarks (52-63) — the lip outline only. In this
+        # repo's insightface 2d106 convention these 12 points, taken in index
+        # order, form a SIMPLE (non-self-intersecting) closed polygon that
+        # cv2.fillPoly fills as one solid region directly over the mouth.
+        # This is the last shipped, known-good landmark set; range(52,72)
+        # (the regression) added the inner-lip points and made the path
+        # self-intersect, and the ancient [65,66,62,...,0,8,7...] indices
+        # belong to a different/older landmark convention (they land on the
+        # inner lip + random jaw points, so the mask never covers the mouth).
+        lower_lip_order = list(range(52, 64))
 
-        # Check if all indices are valid for the loaded landmarks (already partially done by < 106 check)
+        # All indices must be valid for the loaded landmark set
         if max(lower_lip_order) >= landmarks.shape[0]:
-            # print(f"Warning: Landmark index {max(lower_lip_order)} out of bounds for shape {landmarks.shape[0]}.")
+            # print(f"Warning: Landmark index out of bounds for shape {landmarks.shape[0]}.")
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
         lower_lip_landmarks = landmarks[lower_lip_order].astype(np.float32)
@@ -999,16 +1147,22 @@ def create_lower_mouth_mask(
             # print("Warning: Could not calculate valid center for mouth mask.")
             return mask, mouth_cutout, mouth_box, lower_lip_polygon
 
-
+        # Drive expansion from the Mouth Mask slider so it actually responds.
+        # The known-good version expanded by the now-unused mask_down_size
+        # constant, which is why the slider had no effect.
+        # s: 0.0 (slider ~0, tight lip outline) -> 1.0 (slider 100, mouth->chin).
         mouth_mask_size = getattr(modules.globals, "mouth_mask_size", 0.0) # 0-100 slider
-        # 0=tight lip outline, 50=covers mouth area, 100=mouth to chin
-        expansion_factor = 1 + (mouth_mask_size / 100.0) * 2.5
+        s = max(0.0, min(1.0, mouth_mask_size / 100.0))
 
-        # Expand landmarks from center, with extra downward bias toward chin
+        # Uniformly scaling a simple polygon about its centroid keeps it simple
+        # (no self-intersection). x grows with expansion_factor; points below
+        # centre (toward the chin) also get an extra downward stretch so high
+        # slider values reach from the mouth down to the chin.
+        expansion_factor = 1.0 + s * 2.0          # 1.0x -> 3.0x
+        chin_bias = 1.0 + s * 2.0                  # extra downward stretch
         offsets = lower_lip_landmarks - center
-        # Add extra downward expansion for points below center (toward chin)
-        chin_bias = 1 + (mouth_mask_size / 100.0) * 1.5  # extra vertical stretch downward
-        scale_y = np.where(offsets[:, 1] > 0, expansion_factor * chin_bias, expansion_factor)
+        scale_y = np.where(offsets[:, 1] > 0,
+                           expansion_factor * chin_bias, expansion_factor)
         expanded_landmarks = lower_lip_landmarks.copy()
         expanded_landmarks[:, 0] = center[0] + offsets[:, 0] * expansion_factor
         expanded_landmarks[:, 1] = center[1] + offsets[:, 1] * scale_y
@@ -1350,7 +1504,8 @@ def apply_color_transfer(source, target):
             if len(source.shape) == 2: # Grayscale
                 source = cv2.cvtColor(source, cv2.COLOR_GRAY2BGR)
             source = np.clip(source, 0, 255).astype(np.uint8)
-            if len(source.shape)!= 3 or source.shape[2]!= 3: raise ValueError("Conversion failed")
+            if len(source.shape) != 3 or source.shape[2] != 3:
+                raise ValueError("Conversion failed")
         except Exception:
             return source
     if len(target.shape) != 3 or target.shape[2] != 3 or target.dtype != np.uint8:
@@ -1359,7 +1514,8 @@ def apply_color_transfer(source, target):
             if len(target.shape) == 2: # Grayscale
                 target = cv2.cvtColor(target, cv2.COLOR_GRAY2BGR)
             target = np.clip(target, 0, 255).astype(np.uint8)
-            if len(target.shape)!= 3 or target.shape[2]!= 3: raise ValueError("Conversion failed")
+            if len(target.shape) != 3 or target.shape[2] != 3:
+                raise ValueError("Conversion failed")
         except Exception:
              return source # Return original source if target invalid
 
